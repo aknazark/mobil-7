@@ -1,0 +1,398 @@
+name: Praktika8 Auth KZ APK
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Android жобасын жасау
+        run: |
+          set -e
+          mkdir -p app/src/main/java/com/example/authapp
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "AuthApp"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.6.1" apply false
+              id("org.jetbrains.kotlin.android") version "2.0.20" apply false
+              id("org.jetbrains.kotlin.plugin.compose") version "2.0.20" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+              id("org.jetbrains.kotlin.plugin.compose")
+          }
+          android {
+              namespace = "com.example.authapp"
+              compileSdk = 35
+              defaultConfig {
+                  applicationId = "com.example.authapp"
+                  minSdk = 24
+                  targetSdk = 35
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              buildFeatures { compose = true }
+          }
+          kotlin { jvmToolchain(17) }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.09.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.activity:activity-compose:1.9.2")
+              implementation("androidx.datastore:datastore-preferences:1.1.1")
+              implementation("com.squareup.okhttp3:okhttp:4.12.0")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET"/>
+              <application android:theme="@style/AppTheme" android:label="Auth KZ">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar"/>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/example/authapp/MainActivity.kt <<'EOF'
+          package com.example.authapp
+
+          import android.content.Context
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.runtime.saveable.rememberSaveable
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.unit.dp
+          import androidx.datastore.preferences.core.*
+          import androidx.datastore.preferences.preferencesDataStore
+          import kotlinx.coroutines.delay
+          import kotlinx.coroutines.flow.first
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.runBlocking
+          import okhttp3.Authenticator
+          import okhttp3.Interceptor
+          import okhttp3.Request
+          import okhttp3.Response
+          import okhttp3.Route
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          val Context.tokenDataStore by preferencesDataStore(name = "auth_tokens")
+
+          data class Tokens(
+              val access: String,
+              val refresh: String,
+              val expiresAt: Long
+          ) {
+              fun isExpired(): Boolean = System.currentTimeMillis() >= expiresAt
+          }
+
+          class TokenStorage(private val context: Context) {
+              companion object {
+                  val ACCESS = stringPreferencesKey("access")
+                  val REFRESH = stringPreferencesKey("refresh")
+                  val EXPIRES = longPreferencesKey("expires")
+              }
+
+              suspend fun save(tokens: Tokens) {
+                  context.tokenDataStore.edit {
+                      it[ACCESS] = tokens.access
+                      it[REFRESH] = tokens.refresh
+                      it[EXPIRES] = tokens.expiresAt
+                  }
+              }
+
+              suspend fun read(): Tokens? {
+                  val p = context.tokenDataStore.data.first()
+                  val a = p[ACCESS] ?: return null
+                  val r = p[REFRESH] ?: return null
+                  val e = p[EXPIRES] ?: return null
+                  return Tokens(a, r, e)
+              }
+
+              suspend fun clear() {
+                  context.tokenDataStore.edit { it.clear() }
+              }
+          }
+
+          class AuthInterceptor(private val storage: TokenStorage) : Interceptor {
+              override fun intercept(chain: Interceptor.Chain): Response {
+                  val token = runBlocking { storage.read()?.access }
+                  val original = chain.request()
+                  val request = if (token.isNullOrBlank()) original else
+                      original.newBuilder()
+                          .header("Authorization", "Bearer $token")
+                          .build()
+                  return chain.proceed(request)
+              }
+          }
+
+          class TokenAuthenticator(private val storage: TokenStorage) : Authenticator {
+              override fun authenticate(route: Route?, response: Response): Request? {
+                  if (responseCount(response) >= 2) return null
+                  val old = runBlocking { storage.read() } ?: return null
+
+                  // Оқу жобасында refresh нәтижесін модельдейміз.
+                  val newAccess = "access_refreshed_${System.currentTimeMillis()}"
+                  val renewed = old.copy(
+                      access = newAccess,
+                      expiresAt = System.currentTimeMillis() + 60 * 60 * 1000
+                  )
+                  runBlocking { storage.save(renewed) }
+
+                  return response.request.newBuilder()
+                      .header("Authorization", "Bearer $newAccess")
+                      .build()
+              }
+
+              private fun responseCount(response: Response): Int {
+                  var count = 1
+                  var current = response.priorResponse
+                  while (current != null) {
+                      count++
+                      current = current.priorResponse
+                  }
+                  return count
+              }
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent {
+                      MaterialTheme {
+                          AuthApplication()
+                      }
+                  }
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun AuthApplication() {
+              val context = androidx.compose.ui.platform.LocalContext.current
+              val storage = remember { TokenStorage(context.applicationContext) }
+              val scope = rememberCoroutineScope()
+
+              var checking by remember { mutableStateOf(true) }
+              var authorized by remember { mutableStateOf(false) }
+              var tokens by remember { mutableStateOf<Tokens?>(null) }
+              var username by rememberSaveable { mutableStateOf("") }
+              var password by rememberSaveable { mutableStateOf("") }
+              var loginLoading by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf<String?>(null) }
+
+              LaunchedEffect(Unit) {
+                  tokens = storage.read()
+                  authorized = tokens != null
+                  checking = false
+              }
+
+              if (checking) {
+                  Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                      Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                          CircularProgressIndicator()
+                          Spacer(Modifier.height(12.dp))
+                          Text("Авторизация күйі тексерілуде...")
+                      }
+                  }
+                  return
+              }
+
+              if (!authorized) {
+                  Scaffold(
+                      topBar = { TopAppBar(title = { Text("Практикалық жұмыс №8 — Авторизация") }) }
+                  ) { inner ->
+                      Column(
+                          Modifier.padding(inner).padding(20.dp).fillMaxSize(),
+                          verticalArrangement = Arrangement.spacedBy(12.dp)
+                      ) {
+                          Text("Жүйеге кіру", style = MaterialTheme.typography.headlineMedium)
+                          Text("Access және Refresh токендері DataStore ішінде сақталады.")
+
+                          OutlinedTextField(
+                              value = username,
+                              onValueChange = { username = it; error = null },
+                              label = { Text("Логин") },
+                              supportingText = { Text("Мысалы: student") },
+                              singleLine = true,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+
+                          OutlinedTextField(
+                              value = password,
+                              onValueChange = { password = it; error = null },
+                              label = { Text("Құпия сөз") },
+                              supportingText = { Text("Кемінде 4 таңба") },
+                              visualTransformation = PasswordVisualTransformation(),
+                              singleLine = true,
+                              modifier = Modifier.fillMaxWidth()
+                          )
+
+                          Button(
+                              onClick = {
+                                  if (password.length < 4) {
+                                      error = "Құпия сөз кемінде 4 таңбадан тұруы керек"
+                                  } else {
+                                      loginLoading = true
+                                      error = null
+                                      scope.launch {
+                                          delay(600)
+                                          val now = System.currentTimeMillis()
+                                          val t = Tokens(
+                                              access = "access_${username}_$now",
+                                              refresh = "refresh_${username}_$now",
+                                              expiresAt = now + 60 * 60 * 1000
+                                          )
+                                          storage.save(t)
+                                          tokens = t
+                                          authorized = true
+                                          loginLoading = false
+                                      }
+                                  }
+                              },
+                              enabled = username.isNotBlank() && password.isNotBlank() && !loginLoading,
+                              modifier = Modifier.fillMaxWidth()
+                          ) {
+                              Text(if (loginLoading) "Кіру орындалуда..." else "Кіру")
+                          }
+
+                          error?.let {
+                              Text("Қате: $it", color = MaterialTheme.colorScheme.error)
+                          }
+
+                          HorizontalDivider()
+                          Text("Архитектура", style = MaterialTheme.typography.titleMedium)
+                          Text("Compose UI → ViewModel/Repository → DataStore → OkHttp")
+                          Text("Қорғалған сұрауларға: Authorization: Bearer <access>")
+                          Text("401 жауабы кезінде: TokenAuthenticator → refresh → сұрауды қайталау")
+                      }
+                  }
+              } else {
+                  val current = tokens
+                  Scaffold(
+                      topBar = {
+                          TopAppBar(
+                              title = { Text("Пайдаланушы профилі") },
+                              actions = {
+                                  TextButton(onClick = {
+                                      scope.launch {
+                                          storage.clear()
+                                          tokens = null
+                                          authorized = false
+                                          password = ""
+                                      }
+                                  }) { Text("Шығу") }
+                              }
+                          )
+                      }
+                  ) { inner ->
+                      Column(
+                          Modifier.padding(inner).padding(20.dp).fillMaxSize(),
+                          verticalArrangement = Arrangement.spacedBy(10.dp)
+                      ) {
+                          Text("Авторизация сәтті", style = MaterialTheme.typography.headlineSmall)
+                          ElevatedCard(Modifier.fillMaxWidth()) {
+                              Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                  Text("Пайдаланушы ID: 1001")
+                                  Text("Аты: ${username.ifBlank { "Student" }}")
+                                  Text("Email: ${username.ifBlank { "student" }}@aiu.kz")
+                                  Text("Рөлі: Студент")
+                              }
+                          }
+
+                          Text("Токендер күйі", style = MaterialTheme.typography.titleLarge)
+                          Text("Access token: ${if (current?.access != null) "сақталды" else "жоқ"}")
+                          Text("Refresh token: ${if (current?.refresh != null) "сақталды" else "жоқ"}")
+                          Text("Access мерзімі: ${current?.let {
+                              SimpleDateFormat("dd.MM.yyyy HH:mm:ss", Locale.getDefault()).format(Date(it.expiresAt))
+                          } ?: "—"}")
+                          Text("Мерзімі өтіп кетті: ${if (current?.isExpired() == true) "Иә" else "Жоқ"}")
+
+                          HorizontalDivider()
+                          Text("Қауіпсіз сұрау", style = MaterialTheme.typography.titleLarge)
+                          Text("AuthInterceptor әр қорғалған HTTP сұрауына Bearer access токенін қосады.")
+                          Text("TokenAuthenticator 401 алса, жаңа access токенін жасап, сұрауды қайта орындайды.")
+                          Text("Шығу кезінде DataStore толық тазаланып, қолданушы логин экранына қайтады.")
+
+                          Button(
+                              onClick = {
+                                  scope.launch {
+                                      val old = storage.read() ?: return@launch
+                                      val renewed = old.copy(
+                                          access = "access_manual_${System.currentTimeMillis()}",
+                                          expiresAt = System.currentTimeMillis() + 60 * 60 * 1000
+                                      )
+                                      storage.save(renewed)
+                                      tokens = renewed
+                                  }
+                              },
+                              modifier = Modifier.fillMaxWidth()
+                          ) {
+                              Text("Access токенін тест ретінде жаңарту")
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - name: APK құрастыру
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Praktika8-Auth-KZ-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
